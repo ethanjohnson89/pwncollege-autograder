@@ -4,7 +4,51 @@ import tkinter as tk
 from tkinter import messagebox
 from tkcalendar import DateEntry
 from datetime import time
+import tkinter.ttk as ttk
 
+# Custom exceptions for API errors
+class DojoNetworkError(Exception):
+    pass
+
+class DojoNotFoundError(Exception):
+    pass
+
+class DojoParseError(Exception):
+    pass
+
+# Global variables
+all_challenges = {}
+checked_challenges = set()
+dojo = ""
+
+# Downloads the list of all challenges in a dojo
+# Returns a dictionary listing the challenges within their respective modules
+def get_dojo_challenges(dojo):
+    try:
+        response = requests.get(f"https://pwn.college/pwncollege_api/v1/dojos/{dojo}/modules")
+        response.raise_for_status()  # Raise an exception for bad status codes
+        data = response.json()
+        if not data.get("success"):
+            raise DojoNotFoundError(f"API request failed - dojo '{dojo}' may not exist or be accessible")
+        modules = data.get("modules", [])
+        challenges_dict = {}
+        for module in modules:
+            module_id = module["id"]
+            challenges = [ch["id"] for ch in module["challenges"]]
+            challenges_dict[module_id] = challenges
+        return challenges_dict
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            raise DojoNotFoundError(f"Dojo '{dojo}' not found")
+        else:
+            raise DojoNetworkError(f"HTTP error {e.response.status_code}: {e}")
+    except requests.exceptions.RequestException as e:
+        raise DojoNetworkError(f"Network error: {e}")
+    except ValueError as e:  # JSON decode error
+        raise DojoParseError(f"Invalid response format from server")
+
+# Downloads the list of challenges a student has solved within a dojo, with timestamps
+# Returns a dict organizing solved challenges by module
 def get_student_solves(username, dojo):
     response = requests.get(f"https://pwn.college/pwncollege_api/v1/dojos/{dojo}/solves?username={username}")
     data = response.json()
@@ -22,72 +66,237 @@ def get_student_solves(username, dojo):
         solves_dict[module][challenge] = timestamp
     return solves_dict
 
-def get_all_challenges(dojo):
-    response = requests.get(f"https://pwn.college/pwncollege_api/v1/dojos/{dojo}/modules")
-    data = response.json()
-    if not data.get("success"):
-        return {}
-    modules = data.get("modules", [])
-    challenges_dict = {}
-    for module in modules:
-        module_id = module["id"]
-        challenges = [ch["id"] for ch in module["challenges"]]
-        challenges_dict[module_id] = challenges
-    return challenges_dict
-
+# Generates a grading report for a student based on the given deadline and list of assigned
+# challenges selected on the first tab
 def generate_report(username, dojo, deadline):
+    assert all_challenges, "No dojo selected; can't generate report."
+    assert checked_challenges, "No challenges selected; can't generate report."
+
+    # Download the list of challenges solved by the student within this dojo
     solves_dict = get_student_solves(username, dojo)
-    all_challenges = get_all_challenges(dojo)
-    if not all_challenges:
-        return "Failed to retrieve challenges."
-    
+
     report = []
     report.append(f"Username: {username}")
     report.append(f"Dojo: {dojo}")
     report.append(f"Deadline: {deadline.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     report.append("")
-    
+
+    #
+    # Summary of what the student has completed (independent of deadline)
+    #
     total_solves = sum(len(challenges) for challenges in solves_dict.values())
-    report.append(f"Total solves: {total_solves}")
-    module_ids = list(solves_dict.keys())
-    report.append(f"Unique module IDs solved: {', '.join(module_ids)}")
-    challenge_ids = set()
-    for challenges in solves_dict.values():
-        challenge_ids.update(challenges.keys())
-    report.append(f"Unique challenge IDs solved: {', '.join(challenge_ids)}")
-    report.append("")
-    report.append("Challenges:")
-    
-    overall_before_deadline = 0
-    total_challenges = sum(len(ch) for ch in all_challenges.values())
-    
+    report.append(f"Total solves: {total_solves}\n")
+
+    # Get modules with solves in original order
+    module_ids = [module for module in all_challenges.keys() if module in solves_dict]
+    report.append(f"Modules with solves: {', '.join(module_ids)}\n")
+
+    # Get challenges solved in original order (by module, then by challenge order within module)
+    challenge_ids = []
     for module in all_challenges:
-        report.append(f"Module: {module}")
-        challenges_solved = solves_dict.get(module, {})
-        module_before_deadline = 0
-        for challenge in all_challenges[module]:
-            if challenge in challenges_solved:
-                timestamp = challenges_solved[challenge]
-                formatted_timestamp = timestamp.strftime("%Y-%m-%d %H:%M:%S")
-                report.append(f"  {challenge}: Solved at {formatted_timestamp}")
-                if timestamp < deadline:
-                    module_before_deadline += 1
-            else:
-                report.append(f"  {challenge}: Not solved")
-        total_in_module = len(all_challenges[module])
-        overall_before_deadline += module_before_deadline
-        percentage = (module_before_deadline / total_in_module) * 100 if total_in_module > 0 else 0
-        report.append(f"{module_before_deadline}/{total_in_module} solved before deadline ({percentage:.1f}%)")
-        report.append("")
-    
+        if module in solves_dict:
+            for challenge in all_challenges[module]:
+                if challenge in solves_dict[module]:
+                    challenge_ids.append(challenge)
+    report.append(f"Challenges solved: {', '.join(challenge_ids)}")
+    report.append("")
+
+    overall_before_deadline = 0
+    total_challenges = len(checked_challenges)
+
+    #
+    # Detailed breakdown by module
+    #
+    for module in all_challenges:
+        if any(ch in checked_challenges for ch in all_challenges[module]):
+            report.append(f"Module: {module}")
+
+            challenges_solved = solves_dict.get(module, {})
+            module_before_deadline = 0
+
+            for challenge in all_challenges[module]:
+                if challenge in checked_challenges:
+                    if challenge in challenges_solved:
+                        timestamp = challenges_solved[challenge]
+                        formatted_timestamp = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                        report.append(f"  {challenge}: Solved at {formatted_timestamp}")
+                        if timestamp < deadline:
+                            module_before_deadline += 1
+                    else:
+                        report.append(f"  {challenge}: Not solved")
+
+            total_in_module = len([ch for ch in all_challenges[module] if ch in checked_challenges])
+            overall_before_deadline += module_before_deadline
+            percentage = (module_before_deadline / total_in_module) * 100 if total_in_module > 0 else 0
+            report.append(f"{module_before_deadline}/{total_in_module} solved before deadline ({percentage:.1f}%)")
+            report.append("")
+
     overall_percentage = (overall_before_deadline / total_challenges) * 100 if total_challenges > 0 else 0
     report.append(f"Overall: {overall_before_deadline}/{total_challenges} solved before deadline ({overall_percentage:.1f}%)")
-    
+
     return "\n".join(report)
 
-def on_generate():
-    username = username_entry.get()
+# Implements the "Load Challenges" button
+# (downloads the challenge list from pwn.college and populates the tree view)
+def on_load_challenges_click():
+    global dojo, all_challenges, checked_challenges
+
     dojo = dojo_entry.get()
+    if not dojo:
+        messagebox.showerror("Error", "Please enter a dojo name.")
+        return
+
+    # Show downloading message
+    status_label.config(text="Downloading dojo...")
+    root.update()  # Force GUI update
+
+    try:
+        # Download the list of challenges in this dojo
+        all_challenges = get_dojo_challenges(dojo)
+        if not all_challenges:
+            status_label.config(text="")  # Clear status message
+            messagebox.showerror("Error", f"Dojo '{dojo}' exists but has no challenges.")
+            return
+
+        # Clear previous
+        for item in tree.get_children():
+            tree.delete(item)
+        checked_challenges.clear()
+
+        # Populate tree view with the challenge list we downloaded
+        for module, challenges in all_challenges.items():
+            module_item = tree.insert('', 'end', module, text=f'[ ] {module}', tags=('module',), open=True)
+            for ch in challenges:
+                tree.insert(module_item, 'end', text=f'[ ] {ch}', tags=('challenge',))
+
+        # Show the Select All and Deselect All buttons now that we have challenges
+        select_all_button.grid()
+        deselect_all_button.grid()
+
+        # Clear status message
+        status_label.config(text="")
+
+    except DojoNotFoundError as e:
+        status_label.config(text="")
+        messagebox.showerror("Error", str(e))
+    except DojoNetworkError as e:
+        status_label.config(text="")
+        messagebox.showerror("Error", f"Network error: {str(e)}")
+    except DojoParseError as e:
+        status_label.config(text="")
+        messagebox.showerror("Error", f"Server response error: {str(e)}")
+
+# Select all challenges in the dojo
+def on_select_all_click():
+    if not all_challenges:
+        return
+
+    # Find modules that aren't fully checked and toggle them
+    for module_id in tree.get_children():
+        module_text = tree.item(module_id, 'text')
+        if not module_text.startswith('[x]'):
+            toggle_check(module_id)
+
+# Deselect all challenges in the dojo
+def on_deselect_all_click():
+    if not all_challenges:
+        return
+
+    # Find modules that have any selection and toggle them until they're unchecked
+    for module_id in tree.get_children():
+        module_text = tree.item(module_id, 'text')
+        if module_text.startswith('[-]'):
+            # Partially selected - toggle twice (first to select all, then to deselect all)
+            toggle_check(module_id)
+            toggle_check(module_id)
+        elif module_text.startswith('[x]'):
+            # Fully selected - toggle once to deselect
+            toggle_check(module_id)
+
+# Handle tree item clicks
+def on_tree_click(event):
+    item = tree.identify('item', event.x, event.y)
+    if item:
+        toggle_check(item)
+        return "break"  # Prevent default treeview behavior
+
+# Toggle the check state of a tree item (and its children if applicable)
+def toggle_check(item):
+    current_text = tree.item(item, 'text')
+    name = current_text[4:]  # Extract name after '[ ] ' or '[x] ' or '[-] '
+    if '[ ]' in current_text:
+        new_text = current_text.replace('[ ]', '[x]')
+        if 'module' in tree.item(item, 'tags'):
+            # Check all children
+            for child in tree.get_children(item):
+                child_text = tree.item(child, 'text')
+                tree.item(child, text=child_text.replace('[ ]', '[x]'))
+                child_name = child_text[4:]
+                checked_challenges.add(child_name)
+        else:
+            checked_challenges.add(name)
+            tree.item(item, text=new_text)  # Update item first
+            update_parent(item)
+            return  # Exit early to avoid updating twice
+    elif '[x]' in current_text:
+        new_text = current_text.replace('[x]', '[ ]')
+        if 'module' in tree.item(item, 'tags'):
+            # Uncheck all children
+            for child in tree.get_children(item):
+                child_text = tree.item(child, 'text')
+                tree.item(child, text=child_text.replace('[x]', '[ ]'))
+                child_name = child_text[4:]
+                checked_challenges.discard(child_name)
+        else:
+            checked_challenges.discard(name)
+            tree.item(item, text=new_text)  # Update item first
+            update_parent(item)
+            return  # Exit early to avoid updating twice
+    elif '[-]' in current_text:
+        # Treat as select all (check all children)
+        new_text = current_text.replace('[-]', '[x]')
+        if 'module' in tree.item(item, 'tags'):
+            # Check all children
+            for child in tree.get_children(item):
+                child_text = tree.item(child, 'text')
+                tree.item(child, text=child_text.replace('[ ]', '[x]').replace('[-]', '[x]'))
+                child_name = child_text[4:]
+                checked_challenges.add(child_name)
+        else:
+            # Challenges should never have children, so this should not happen
+            assert False, "Challenge items should not have children"
+    tree.item(item, text=new_text)
+
+# Update a parent item's checkbox state in response to a change in one of its children
+def update_parent(child):
+    parent = tree.parent(child)
+    if parent:
+        children = tree.get_children(parent)
+        checked_count = sum(1 for c in children if '[x]' in tree.item(c, 'text'))
+        parent_text = tree.item(parent, 'text')
+
+        # Extract parent name - all checkbox prefixes are exactly 4 characters
+        # (namely: [ ] , [x] , [-])
+        parent_name = parent_text[4:]
+
+        # Update the parent item's text based on the children's checked state
+        if checked_count == 0:
+            new_parent_text = f'[ ] {parent_name}'
+        elif checked_count == len(children):
+            new_parent_text = f'[x] {parent_name}'
+        else:
+            new_parent_text = f'[-] {parent_name}'
+
+        # Apply the new text to the parent's entry in the tree
+        tree.item(parent, text=new_parent_text)
+
+# Implements the "Generate Report" button
+#
+# Downloads the student's completed challenges and compares them with the selected challenges
+# and deadline to determine the student's grade. All selected challenges are weighted equally
+# regardless of how they break down into modules.
+def on_generate_report_click():
+    username = username_entry.get()
     try:
         date = date_entry.get_date()
         hour = int(hour_entry.get())
@@ -99,60 +308,142 @@ def on_generate():
     except ValueError:
         messagebox.showerror("Error", "Invalid input values.")
         return
-    if not username or not dojo:
-        messagebox.showerror("Error", "Please fill in username and dojo.")
+    if not username or not checked_challenges:
+        messagebox.showerror("Error", "Please fill in username and select challenges.")
         return
     report = generate_report(username, dojo, deadline)
-    report_text.delete(1.0, tk.END)
+    report_text.delete("1.0", tk.END) # N.B.: "1.0" here selects "line 1, character 0"
     report_text.insert(tk.END, report)
+
+# Implements the "Now" button
+# (inserts the current time and date into the deadline fields)
+def on_now_click():
+    now = datetime.now()
+    date_entry.set_date(now.date())
+    hour_entry.delete(0, tk.END)
+    hour_entry.insert(0, str(now.hour))
+    min_entry.delete(0, tk.END)
+    min_entry.insert(0, str(now.minute))
+    sec_entry.delete(0, tk.END)
+    sec_entry.insert(0, str(now.second))
+
+    # Set UTC offset to match local timezone
+    local_offset_seconds = now.astimezone().utcoffset().total_seconds()
+    local_offset_hours = int(local_offset_seconds / 3600)
+    offset_entry.delete(0, tk.END)
+    offset_entry.insert(0, str(local_offset_hours))
 
 # GUI setup
 root = tk.Tk()
 root.title("PwnCollege Autograder")
 root.resizable(True, True)
 
+# Center the window on screen
+window_width = 800
+window_height = 600
+screen_width = root.winfo_screenwidth()
+screen_height = root.winfo_screenheight()
+x = (screen_width // 2) - (window_width // 2)
+y = (screen_height // 2) - (window_height // 2)
+root.geometry(f"{window_width}x{window_height}+{x}+{y}")
+
+notebook = ttk.Notebook(root)
+notebook.pack(fill='both', expand=True)
+
+# Tab 1: Select Dojo and Assignments
+tab1 = ttk.Frame(notebook)
+notebook.add(tab1, text="Select Dojo and Assignments")
+
+# Create input frame for dojo controls
+dojo_frame = tk.Frame(tab1)
+dojo_frame.pack(anchor="w", pady=5)
+
+tk.Label(dojo_frame, text="Dojo:").grid(row=0, column=0, sticky="w")
+dojo_entry = tk.Entry(dojo_frame)
+dojo_entry.grid(row=0, column=1, sticky="w", padx=(5, 5))
+dojo_entry.bind('<Return>', lambda e: on_load_challenges_click())
+load_button = tk.Button(dojo_frame, text="Load Challenges", command=on_load_challenges_click)
+load_button.grid(row=0, column=2, sticky="w")
+select_all_button = tk.Button(dojo_frame, text="Select All", command=on_select_all_click)
+select_all_button.grid(row=0, column=3, sticky="w", padx=(5, 0))
+select_all_button.grid_remove()  # Hide initially
+deselect_all_button = tk.Button(dojo_frame, text="Deselect All", command=on_deselect_all_click)
+deselect_all_button.grid(row=0, column=4, sticky="w", padx=(5, 0))
+deselect_all_button.grid_remove()  # Hide initially
+status_label = tk.Label(dojo_frame, text="") # displays download status when active
+status_label.grid(row=0, column=5, sticky="w", padx=(5, 0))
+
+# Create a frame for the tree and scrollbar
+tree_frame = tk.Frame(tab1)
+tree_frame.pack(fill='both', expand=True)
+
+tree_scrollbar = tk.Scrollbar(tree_frame)
+tree_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+tree = ttk.Treeview(tree_frame, show='tree', yscrollcommand=tree_scrollbar.set)
+tree.pack(side=tk.LEFT, fill='both', expand=True)
+
+tree_scrollbar.config(command=tree.yview)
+
+# Hide +/- buttons to expand/contract the tree by customizing the layout
+# (we couldn't support them properly without item selection toggling glitching out)
+style = ttk.Style()
+style.layout("Treeview.Item", [
+    ('Treeitem.padding', {'sticky': 'nswe', 'children': [
+        ('Treeitem.text', {'sticky': 'nswe'})
+    ]})
+])
+tree.bind('<Button-1>', on_tree_click)
+# Disable tree item opening/closing
+tree.bind('<Double-1>', lambda e: "break")
+tree.bind('<<TreeviewOpen>>', lambda e: "break")
+tree.bind('<<TreeviewClose>>', lambda e: "break")
+
+# Tab 2: Generate Report
+tab2 = ttk.Frame(notebook)
+notebook.add(tab2, text="Generate Report")
+
 # Create input frame to keep inputs left-justified
-input_frame = tk.Frame(root)
-input_frame.grid(row=0, column=0, sticky="nw")
+input_frame = tk.Frame(tab2)
+input_frame.pack(anchor="w")
 
 tk.Label(input_frame, text="Username:").grid(row=0, column=0, sticky="w")
 username_entry = tk.Entry(input_frame)
 username_entry.grid(row=0, column=1, sticky="w")
 
-tk.Label(input_frame, text="Dojo:").grid(row=1, column=0, sticky="w")
-dojo_entry = tk.Entry(input_frame)
-dojo_entry.grid(row=1, column=1, sticky="w")
-
-tk.Label(input_frame, text="Deadline Date:").grid(row=2, column=0, sticky="w")
+tk.Label(input_frame, text="Deadline Date:").grid(row=1, column=0, sticky="w")
 date_entry = DateEntry(input_frame, date_pattern='yyyy-mm-dd')
-date_entry.grid(row=2, column=1, sticky="w")
+date_entry.grid(row=1, column=1, sticky="w")
 
-tk.Label(input_frame, text="Hour (0-23):").grid(row=2, column=2, sticky="w")
+tk.Label(input_frame, text="Hour (0-23):").grid(row=1, column=2, sticky="w")
 hour_entry = tk.Entry(input_frame, width=3)
 hour_entry.insert(0, "0")
-hour_entry.grid(row=2, column=3, sticky="w")
+hour_entry.grid(row=1, column=3, sticky="w")
 
-tk.Label(input_frame, text="Minute (0-59):").grid(row=2, column=4, sticky="w")
+tk.Label(input_frame, text="Minute (0-59):").grid(row=1, column=4, sticky="w")
 min_entry = tk.Entry(input_frame, width=3)
 min_entry.insert(0, "0")
-min_entry.grid(row=2, column=5, sticky="w")
+min_entry.grid(row=1, column=5, sticky="w")
 
-tk.Label(input_frame, text="Second (0-59):").grid(row=2, column=6, sticky="w")
+tk.Label(input_frame, text="Second (0-59):").grid(row=1, column=6, sticky="w")
 sec_entry = tk.Entry(input_frame, width=3)
 sec_entry.insert(0, "0")
-sec_entry.grid(row=2, column=7, sticky="w")
+sec_entry.grid(row=1, column=7, sticky="w")
 
-tk.Label(input_frame, text="UTC Offset (hours):").grid(row=2, column=8, sticky="w")
+tk.Label(input_frame, text="UTC Offset (hours):").grid(row=1, column=8, sticky="w")
 offset_entry = tk.Entry(input_frame, width=4)
 offset_entry.insert(0, "0")
-offset_entry.grid(row=2, column=9, sticky="w")
+offset_entry.grid(row=1, column=9, sticky="w")
 
-generate_button = tk.Button(input_frame, text="Generate Report", command=on_generate)
-generate_button.grid(row=3, column=0, columnspan=10, sticky="w")
+now_button = tk.Button(input_frame, text="Now", command=on_now_click)
+now_button.grid(row=1, column=10, sticky="w")
 
-# Create a frame for the text area and scrollbar
-text_frame = tk.Frame(root)
-text_frame.grid(row=1, column=0, sticky='nsew')
+generate_button = tk.Button(input_frame, text="Generate Report", command=on_generate_report_click)
+generate_button.grid(row=2, column=0, columnspan=11, sticky="w")
+
+# Text area
+text_frame = tk.Frame(tab2)
+text_frame.pack(fill='both', expand=True)
 
 scrollbar = tk.Scrollbar(text_frame)
 scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -162,7 +453,7 @@ report_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
 scrollbar.config(command=report_text.yview)
 
-root.rowconfigure(1, weight=1)
-root.columnconfigure(0, weight=1)
+tab2.rowconfigure(3, weight=1)
+tab2.columnconfigure(0, weight=1)
 
 root.mainloop()
