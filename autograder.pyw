@@ -20,6 +20,7 @@ class DojoParseError(Exception):
 all_challenges = {}
 checked_challenges = set()
 dojo = ""
+current_timezone = None  # Track the timezone from "Now" button
 
 # Downloads the list of all challenges in a dojo
 # Returns a dictionary listing the challenges within their respective modules
@@ -66,6 +67,42 @@ def get_student_solves(username, dojo):
         solves_dict[module][challenge] = timestamp
     return solves_dict
 
+# Helper function to get timezone display string
+def get_timezone_display(deadline, abbreviated=False):
+    # Check if we have original timezone info and it matches the deadline offset.
+    #
+    # If the user entered an offset manually, we can't unambiguously determine the timezone,
+    # but the typical expected use case is that the user won't change the default.
+    #
+    # We'd ideally like to provide both full and abbreviated timezone names (e.g.,
+    # "Eastern Daylight Time" vs "EDT"), so the latter can be used in more repetitive displays
+    # like the per-module breakdown in the grade report. But Python's datetime module doesn't
+    # provide a reliable way to get both forms (some systems return one or the other).
+    # So, we expect to have to fall back to just the UTC offset display in at least one of the
+    # two cases - but this code at least gives us the best we can get, and ensures we don't
+    # get the long-form display when the calling code specifically asks for an abbreviation.
+    if current_timezone:
+        try:
+            current_offset = current_timezone.utcoffset(datetime.now())
+            if current_offset == deadline.utcoffset():
+                # Use the original timezone to get the timezone's proper name
+                temp_time = datetime.now(current_timezone)
+                if abbreviated:
+                    # Try to get abbreviated timezone name (EDT, PST, etc.)
+                    tz_abbrev = temp_time.strftime('%Z')
+                    if tz_abbrev and not tz_abbrev.startswith(('UTC', '+', '-')) and len(tz_abbrev) <= 5:
+                        return f"{tz_abbrev} (UTC{deadline.utcoffset().total_seconds()/3600:+.0f})"
+                else:
+                    # Get full timezone name
+                    tz_name = temp_time.strftime('%Z')
+                    if tz_name and not tz_name.startswith(('UTC', '+', '-')):
+                        return f"{tz_name} (UTC{deadline.utcoffset().total_seconds()/3600:+.0f})"
+        except:
+            pass
+
+    # Fall back to just displaying UTC offset
+    return f"(UTC{deadline.utcoffset().total_seconds()/3600:+.0f})"
+
 # Generates a grading report for a student based on the given deadline and list of assigned
 # challenges selected on the first tab
 def generate_report(username, dojo, deadline):
@@ -78,7 +115,13 @@ def generate_report(username, dojo, deadline):
     report = []
     report.append(f"Username: {username}")
     report.append(f"Dojo: {dojo}")
-    report.append(f"Deadline: {deadline.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+
+    # Convert deadline to the specified timezone for display
+    deadline_local = deadline.astimezone(deadline.tzinfo)
+    tz_display = get_timezone_display(deadline)  # Full name for deadline
+    tz_display_short = get_timezone_display(deadline, abbreviated=True)  # Short for solve times
+
+    report.append(f"Deadline: {deadline_local.strftime('%Y-%m-%d %H:%M:%S')} {tz_display}")
     report.append("")
 
     #
@@ -118,8 +161,10 @@ def generate_report(username, dojo, deadline):
                 if challenge in checked_challenges:
                     if challenge in challenges_solved:
                         timestamp = challenges_solved[challenge]
-                        formatted_timestamp = timestamp.strftime("%Y-%m-%d %H:%M:%S")
-                        report.append(f"  {challenge}: Solved at {formatted_timestamp}")
+                        # Convert solve timestamp to the same timezone as deadline
+                        timestamp_local = timestamp.astimezone(deadline.tzinfo)
+                        formatted_timestamp = timestamp_local.strftime("%Y-%m-%d %H:%M:%S")
+                        report.append(f"  {challenge}: Solved at {formatted_timestamp} {tz_display_short}")
                         if timestamp < deadline:
                             module_before_deadline += 1
                     else:
@@ -308,17 +353,33 @@ def on_generate_report_click():
     except ValueError:
         messagebox.showerror("Error", "Invalid input values.")
         return
-    if not username or not checked_challenges:
-        messagebox.showerror("Error", "Please fill in username and select challenges.")
+    if not username:
+        messagebox.showerror("Error", "Please enter a username.")
         return
+    elif not checked_challenges:
+        messagebox.showerror("Error", "Please select at least one challenge.")
+        return
+
+    # Clear the text box to signal that generation is starting
+    report_text.delete("1.0", tk.END)  # N.B.: "1.0" here selects "line 1, character 0"
+
+    # Show downloading message
+    report_status_label.config(text="Downloading user solves...")
+    root.update()  # Force GUI update
+
     report = generate_report(username, dojo, deadline)
-    report_text.delete("1.0", tk.END) # N.B.: "1.0" here selects "line 1, character 0"
     report_text.insert(tk.END, report)
 
-# Implements the "Now" button
-# (inserts the current time and date into the deadline fields)
-def on_now_click():
+    # Clear status message
+    report_status_label.config(text="")
+
+# Implements the "Now" button (sets current time in the GUI deadline fields)
+# Can also be called directly from other code that wishes to do this (e.g. on program startup)
+def set_current_time():
+    global current_timezone
     now = datetime.now()
+    current_timezone = now.astimezone().tzinfo  # Store the original timezone
+
     date_entry.set_date(now.date())
     hour_entry.delete(0, tk.END)
     hour_entry.insert(0, str(now.hour))
@@ -370,7 +431,7 @@ select_all_button.grid_remove()  # Hide initially
 deselect_all_button = tk.Button(dojo_frame, text="Deselect All", command=on_deselect_all_click)
 deselect_all_button.grid(row=0, column=4, sticky="w", padx=(5, 0))
 deselect_all_button.grid_remove()  # Hide initially
-status_label = tk.Label(dojo_frame, text="") # displays download status when active
+status_label = tk.Label(dojo_frame, text="")  # displays download status when active
 status_label.grid(row=0, column=5, sticky="w", padx=(5, 0))
 
 # Create a frame for the tree and scrollbar
@@ -410,6 +471,7 @@ input_frame.pack(anchor="w")
 tk.Label(input_frame, text="Username:").grid(row=0, column=0, sticky="w")
 username_entry = tk.Entry(input_frame)
 username_entry.grid(row=0, column=1, sticky="w")
+username_entry.bind('<Return>', lambda e: on_generate_report_click())
 
 tk.Label(input_frame, text="Deadline Date:").grid(row=1, column=0, sticky="w")
 date_entry = DateEntry(input_frame, date_pattern='yyyy-mm-dd')
@@ -435,11 +497,13 @@ offset_entry = tk.Entry(input_frame, width=4)
 offset_entry.insert(0, "0")
 offset_entry.grid(row=1, column=9, sticky="w")
 
-now_button = tk.Button(input_frame, text="Now", command=on_now_click)
+now_button = tk.Button(input_frame, text="Now", command=set_current_time)
 now_button.grid(row=1, column=10, sticky="w")
 
 generate_button = tk.Button(input_frame, text="Generate Report", command=on_generate_report_click)
-generate_button.grid(row=2, column=0, columnspan=11, sticky="w")
+generate_button.grid(row=2, column=0, sticky="w")
+report_status_label = tk.Label(input_frame, text="")  # displays download status when active
+report_status_label.grid(row=2, column=1, sticky="w", padx=(5, 0))
 
 # Text area
 text_frame = tk.Frame(tab2)
@@ -455,5 +519,8 @@ scrollbar.config(command=report_text.yview)
 
 tab2.rowconfigure(3, weight=1)
 tab2.columnconfigure(0, weight=1)
+
+# Initialize the time fields with current time
+root.after(100, set_current_time)  # Call after GUI is fully constructed
 
 root.mainloop()
