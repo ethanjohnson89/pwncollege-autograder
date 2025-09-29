@@ -51,21 +51,32 @@ def get_dojo_challenges(dojo):
 # Downloads the list of challenges a student has solved within a dojo, with timestamps
 # Returns a dict organizing solved challenges by module
 def get_student_solves(username, dojo):
-    response = requests.get(f"https://pwn.college/pwncollege_api/v1/dojos/{dojo}/solves?username={username}")
-    data = response.json()
-    if not data.get("success"):
-        return {}
-    solves = data.get("solves", [])
-    solves_dict = {}
-    for solve in solves:
-        module = solve["module_id"]
-        challenge = solve["challenge_id"]
-        timestamp_str = solve["timestamp"]
-        timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-        if module not in solves_dict:
-            solves_dict[module] = {}
-        solves_dict[module][challenge] = timestamp
-    return solves_dict
+    try:
+        response = requests.get(f"https://pwn.college/pwncollege_api/v1/dojos/{dojo}/solves?username={username}")
+        response.raise_for_status()  # Raise an exception for bad status codes
+        data = response.json()
+        if not data.get("success"):
+            raise DojoNotFoundError(f"API request failed - username '{username}' may not exist or be accessible")
+        solves = data.get("solves", [])
+        solves_dict = {}
+        for solve in solves:
+            module = solve["module_id"]
+            challenge = solve["challenge_id"]
+            timestamp_str = solve["timestamp"]
+            timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+            if module not in solves_dict:
+                solves_dict[module] = {}
+            solves_dict[module][challenge] = timestamp
+        return solves_dict
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 404:
+            raise DojoNotFoundError(f"User '{username}' not found or dojo '{dojo}' not accessible")
+        else:
+            raise DojoNetworkError(f"HTTP error {e.response.status_code}: {e}")
+    except requests.exceptions.RequestException as e:
+        raise DojoNetworkError(f"Network error: {e}")
+    except ValueError as e:  # JSON decode error
+        raise DojoParseError(f"Invalid response format from server")
 
 # Helper function to get timezone display string
 def get_timezone_display(deadline, abbreviated=False):
@@ -367,8 +378,15 @@ def on_generate_report_click():
     report_status_label.config(text="Downloading user solves...")
     root.update()  # Force GUI update
 
-    report = generate_report(username, dojo, deadline)
-    report_text.insert(tk.END, report)
+    try:
+        report = generate_report(username, dojo, deadline)
+        report_text.insert(tk.END, report)
+    except DojoNotFoundError as e:
+        messagebox.showerror("Error", str(e))
+    except DojoNetworkError as e:
+        messagebox.showerror("Error", f"Network error: {str(e)}")
+    except DojoParseError as e:
+        messagebox.showerror("Error", f"Server response error: {str(e)}")
 
     # Clear status message
     report_status_label.config(text="")
