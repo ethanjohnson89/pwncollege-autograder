@@ -162,14 +162,16 @@ def generate_report(username, dojo, deadline):
     # Detailed breakdown by module
     #
     for module in all_challenges:
-        if any(ch in checked_challenges for ch in all_challenges[module]):
+        # Check if any challenge in this module is assigned
+        # (tracking challenges as "module:challenge", since different modules could have challenges with the same name)
+        if any(f"{module}:{ch}" in checked_challenges for ch in all_challenges[module]):
             report.append(f"Module: {module}")
 
             challenges_solved = solves_dict.get(module, {})
             module_before_deadline = 0
 
             for challenge in all_challenges[module]:
-                if challenge in checked_challenges:
+                if f"{module}:{challenge}" in checked_challenges:
                     if challenge in challenges_solved:
                         timestamp = challenges_solved[challenge]
                         # Convert solve timestamp to the same timezone as deadline
@@ -181,7 +183,7 @@ def generate_report(username, dojo, deadline):
                     else:
                         report.append(f"  {challenge}: Not solved")
 
-            total_in_module = len([ch for ch in all_challenges[module] if ch in checked_challenges])
+            total_in_module = len([ch for ch in all_challenges[module] if f"{module}:{ch}" in checked_challenges])
             overall_before_deadline += module_before_deadline
             percentage = (module_before_deadline / total_in_module) * 100 if total_in_module > 0 else 0
             report.append(f"{module_before_deadline}/{total_in_module} solved before deadline ({percentage:.1f}%)")
@@ -284,13 +286,17 @@ def toggle_check(item):
         new_text = current_text.replace('[ ]', '[x]')
         if 'module' in tree.item(item, 'tags'):
             # Check all children
+            module_name = name
             for child in tree.get_children(item):
                 child_text = tree.item(child, 'text')
                 tree.item(child, text=child_text.replace('[ ]', '[x]'))
                 child_name = child_text[4:]
-                checked_challenges.add(child_name)
+                checked_challenges.add(f"{module_name}:{child_name}")
         else:
-            checked_challenges.add(name)
+            # Get the module name from the parent
+            parent = tree.parent(item)
+            module_name = tree.item(parent, 'text')[4:]
+            checked_challenges.add(f"{module_name}:{name}")
             tree.item(item, text=new_text)  # Update item first
             update_parent(item)
             return  # Exit early to avoid updating twice
@@ -298,13 +304,17 @@ def toggle_check(item):
         new_text = current_text.replace('[x]', '[ ]')
         if 'module' in tree.item(item, 'tags'):
             # Uncheck all children
+            module_name = name
             for child in tree.get_children(item):
                 child_text = tree.item(child, 'text')
                 tree.item(child, text=child_text.replace('[x]', '[ ]'))
                 child_name = child_text[4:]
-                checked_challenges.discard(child_name)
+                checked_challenges.discard(f"{module_name}:{child_name}")
         else:
-            checked_challenges.discard(name)
+            # Get the module name from the parent
+            parent = tree.parent(item)
+            module_name = tree.item(parent, 'text')[4:]
+            checked_challenges.discard(f"{module_name}:{name}")
             tree.item(item, text=new_text)  # Update item first
             update_parent(item)
             return  # Exit early to avoid updating twice
@@ -313,11 +323,12 @@ def toggle_check(item):
         new_text = current_text.replace('[-]', '[x]')
         if 'module' in tree.item(item, 'tags'):
             # Check all children
+            module_name = name
             for child in tree.get_children(item):
                 child_text = tree.item(child, 'text')
                 tree.item(child, text=child_text.replace('[ ]', '[x]').replace('[-]', '[x]'))
                 child_name = child_text[4:]
-                checked_challenges.add(child_name)
+                checked_challenges.add(f"{module_name}:{child_name}")
         else:
             # Challenges should never have children, so this should not happen
             assert False, "Challenge items should not have children"
