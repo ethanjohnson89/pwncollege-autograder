@@ -133,6 +133,7 @@ def generate_report(username, dojo, deadline):
     tz_display_short = get_timezone_display(deadline, abbreviated=True)  # Short for solve times
 
     report.append(f"Deadline: {deadline_local.strftime('%Y-%m-%d %H:%M:%S')} {tz_display}")
+    report.append(f"Graded at: {datetime.now(timezone.utc).astimezone(deadline.tzinfo).strftime('%Y-%m-%d %H:%M:%S')} {tz_display}")
     report.append("")
 
     #
