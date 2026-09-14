@@ -460,7 +460,7 @@ def ask_nonempty_batch_dir():
     # resizable(False) or geometry("+x+y") before that freezes the
     # window at the first widget's size and clips the buttons.
     dialog.withdraw()
-    dialog.title("Batch report directory")
+    dialog.title("Batch report directory is not empty")
     dialog.transient(root)
 
     result = {"choice": "cancel"}
@@ -474,12 +474,13 @@ def ask_nonempty_batch_dir():
 
     tk.Label(
         container,
-        text=f"Directory '{BATCH_REPORT_DIRNAME}' is not empty",
+        text=f"Output directory '{BATCH_REPORT_DIRNAME}' is not empty (may "
+              "contain reports from a previous run).",
     ).pack(anchor="w", pady=(0, 8))
 
     buttons = [
         ("Erase existing contents", "erase"),
-        ("Merge (overwrite existing with same names)",
+        ("Merge (overwrite existing files with same names)",
          "merge"),
         ("Rename existing directory (add date suffix) "
          "then proceed", "rename"),
