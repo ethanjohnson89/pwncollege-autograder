@@ -1,4 +1,5 @@
 import csv
+import io
 import os
 import requests
 from datetime import datetime, timezone, timedelta
@@ -453,6 +454,21 @@ def allocate_batch_report_dir(assignment_name=""):
     base = batch_report_dirname(assignment_name)
     return disambiguate_path(os.path.join(script_dir, base))
 
+# Decode CSV bytes from Excel's common save formats.
+#
+# "CSV UTF-8" writes UTF-8 with a BOM; plain "CSV" on Windows
+# Excel uses the ANSI code page (cp1252) and no BOM. A UTF-16
+# BOM (Excel "Unicode Text") is also recognized.
+def decode_csv_bytes(raw):
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw.decode("utf-8-sig")
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")
+
 # Read students from a CSV with columns: last, first, username.
 #
 # Blank lines and # comments are ignored. A header row is skipped
@@ -463,41 +479,42 @@ def load_students_from_csv(path):
     students = []
     seen = set()
     first_data = True
-    with open(path, encoding="utf-8-sig", newline="") as handle:
-        reader = csv.reader(handle)
-        for row_num, row in enumerate(reader, 1):
-            if not row or all(not c.strip() for c in row):
+    with open(path, "rb") as handle:
+        text = decode_csv_bytes(handle.read())
+    reader = csv.reader(io.StringIO(text, newline=""))
+    for row_num, row in enumerate(reader, 1):
+        if not row or all(not c.strip() for c in row):
+            continue
+        if row[0].lstrip().startswith("#"):
+            continue
+        if len(row) < 3:
+            raise ValueError(
+                f"Line {row_num}: expected 3 columns "
+                f"(last, first, username), "
+                f"found {len(row)}")
+        last = row[0].strip()
+        first = row[1].strip()
+        username = row[2].strip()
+        if first_data:
+            first_data = False
+            if (last.lower() in (
+                    "last", "lastname", "last name")
+                    and first.lower() in (
+                        "first", "firstname",
+                        "first name")):
                 continue
-            if row[0].lstrip().startswith("#"):
-                continue
-            if len(row) < 3:
-                raise ValueError(
-                    f"Line {row_num}: expected 3 columns "
-                    f"(last, first, username), "
-                    f"found {len(row)}")
-            last = row[0].strip()
-            first = row[1].strip()
-            username = row[2].strip()
-            if first_data:
-                first_data = False
-                if (last.lower() in (
-                        "last", "lastname", "last name")
-                        and first.lower() in (
-                            "first", "firstname",
-                            "first name")):
-                    continue
-            if not last or not first or not username:
-                raise ValueError(
-                    f"Line {row_num}: last name, first name, "
-                    f"and username are all required")
-            if username in seen:
-                continue
-            seen.add(username)
-            students.append({
-                "last": last,
-                "first": first,
-                "username": username,
-            })
+        if not last or not first or not username:
+            raise ValueError(
+                f"Line {row_num}: last name, first name, "
+                f"and username are all required")
+        if username in seen:
+            continue
+        seen.add(username)
+        students.append({
+            "last": last,
+            "first": first,
+            "username": username,
+        })
     return students
 
 # Append a line to the report text box and scroll it into view
