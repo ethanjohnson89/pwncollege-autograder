@@ -1,7 +1,8 @@
+import os
 import requests
 from datetime import datetime, timezone, timedelta
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 from tkcalendar import DateEntry
 from datetime import time
 import tkinter.ttk as ttk
@@ -21,6 +22,14 @@ all_challenges = {}
 checked_challenges = set()
 dojo = ""
 current_timezone = None  # Track the timezone from "Now" button
+
+# Path to the student-username list used in batch mode, or None if
+# no file has been selected yet.
+username_file_path = None
+
+# Subfolder (next to this script) where batch mode writes per-student
+# report files.
+BATCH_REPORT_DIRNAME = "batch-report"
 
 # Downloads the list of all challenges in a dojo
 # Returns a dictionary listing the challenges within their respective modules
@@ -80,6 +89,7 @@ def get_student_solves(username, dojo):
 
 # Helper function to get timezone display string
 def get_timezone_display(deadline, abbreviated=False):
+    #
     # Check if we have original timezone info and it matches the deadline offset.
     #
     # If the user entered an offset manually, we can't unambiguously determine the timezone,
@@ -92,6 +102,7 @@ def get_timezone_display(deadline, abbreviated=False):
     # So, we expect to have to fall back to just the UTC offset display in at least one of the
     # two cases - but this code at least gives us the best we can get, and ensures we don't
     # get the long-form display when the calling code specifically asks for an abbreviation.
+    #
     if current_timezone:
         try:
             current_offset = current_timezone.utcoffset(datetime.now())
@@ -358,13 +369,52 @@ def update_parent(child):
         # Apply the new text to the parent's entry in the tree
         tree.item(parent, text=new_parent_text)
 
-# Implements the "Generate Report" button
+# Build a filesystem-safe .txt filename from a student username
+def report_filename_for(username):
+    allowed = []
+    for ch in username:
+        if ch.isalnum() or ch in "._-":
+            allowed.append(ch)
+        else:
+            allowed.append("_")
+    safe = "".join(allowed).strip("._")
+    if not safe:
+        safe = "unknown"
+    return f"{safe}.txt"
+
+# Absolute path of the batch-report output directory (next to this script)
+def batch_report_dir():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(script_dir, BATCH_REPORT_DIRNAME)
+
+# Read student usernames from a text file (one per line).
 #
-# Downloads the student's completed challenges and compares them with the selected challenges
-# and deadline to determine the student's grade. All selected challenges are weighted equally
-# regardless of how they break down into modules.
-def on_generate_report_click():
-    username = username_entry.get()
+# Blank lines and # comments are ignored, surrounding whitespace is
+# stripped, and duplicates are dropped while preserving first-seen
+# order.
+def load_usernames_from_file(path):
+    usernames = []
+    seen = set()
+    with open(path, encoding="utf-8-sig") as handle:
+        for line in handle:
+            name = line.strip()
+            if not name or name.startswith("#") or name in seen:
+                continue
+            seen.add(name)
+            usernames.append(name)
+    return usernames
+
+# Append a line to the report text box and scroll it into view
+def append_report_progress(message):
+    report_text.insert(tk.END, message + "\n")
+    report_text.see(tk.END)
+    root.update()
+
+# Read the deadline fields from the GUI.
+#
+# Returns a timezone-aware datetime, or None if the values are
+# invalid (an error dialog is shown in that case).
+def parse_deadline_from_gui():
     try:
         date = date_entry.get_date()
         hour = int(hour_entry.get())
@@ -372,23 +422,54 @@ def on_generate_report_click():
         second = int(sec_entry.get())
         offset_hours = int(offset_entry.get())
         tz = timezone(timedelta(hours=offset_hours))
-        deadline = datetime.combine(date, time(hour, minute, second)).replace(tzinfo=tz)
+        return datetime.combine(
+            date, time(hour, minute, second)
+        ).replace(tzinfo=tz)
     except ValueError:
         messagebox.showerror("Error", "Invalid input values.")
+        return None
+
+# Enable the widgets that match the selected report mode
+def on_report_mode_change():
+    if report_mode.get() == "single":
+        username_entry.config(state=tk.NORMAL)
+        select_file_button.config(state=tk.DISABLED)
+    else:
+        username_entry.config(state=tk.DISABLED)
+        select_file_button.config(state=tk.NORMAL)
+
+# Launch a file picker and remember the chosen username list
+def on_select_username_file_click():
+    global username_file_path
+    path = filedialog.askopenfilename(
+        title="Select username list",
+        filetypes=[
+            ("Text files", "*.txt"),
+            ("All files", "*.*"),
+        ])
+    if not path:
         return
+    username_file_path = path
+    try:
+        count = len(load_usernames_from_file(path))
+        username_file_label.config(
+            text=f"{os.path.basename(path)} ({count} student(s))")
+    except OSError:
+        username_file_label.config(text=os.path.basename(path))
+
+# Generate one student's report into the GUI text box
+def run_single_report(deadline):
+    username = username_entry.get().strip()
     if not username:
         messagebox.showerror("Error", "Please enter a username.")
         return
-    elif not checked_challenges:
-        messagebox.showerror("Error", "Please select at least one challenge.")
-        return
 
     # Clear the text box to signal that generation is starting
-    report_text.delete("1.0", tk.END)  # N.B.: "1.0" here selects "line 1, character 0"
+    # N.B.: "1.0" here selects "line 1, character 0"
+    report_text.delete("1.0", tk.END)
 
-    # Show downloading message
     report_status_label.config(text="Downloading user solves...")
-    root.update()  # Force GUI update
+    root.update()
 
     try:
         report = generate_report(username, dojo, deadline)
@@ -398,10 +479,134 @@ def on_generate_report_click():
     except DojoNetworkError as e:
         messagebox.showerror("Error", f"Network error: {str(e)}")
     except DojoParseError as e:
-        messagebox.showerror("Error", f"Server response error: {str(e)}")
+        messagebox.showerror(
+            "Error", f"Server response error: {str(e)}")
 
-    # Clear status message
-    report_status_label.config(text="")
+# Generate one student's report and write it under output_dir.
+# Returns True on success, False on failure (already logged).
+def write_one_batch_report(username, deadline, output_dir):
+    try:
+        report = generate_report(username, dojo, deadline)
+        filename = report_filename_for(username)
+        out_path = os.path.join(output_dir, filename)
+        with open(out_path, "w", encoding="utf-8") as handle:
+            handle.write(report)
+            if not report.endswith("\n"):
+                handle.write("\n")
+
+        # Include the overall score in the progress line so the
+        # batch log is scannable without opening every file.
+        last_line = report.strip().split("\n")[-1]
+        if last_line.startswith("Overall:"):
+            append_report_progress(
+                f"{username}: done - {last_line} ({filename})")
+        else:
+            append_report_progress(
+                f"{username}: done ({filename})")
+        return True
+    except (DojoNotFoundError, DojoNetworkError,
+            DojoParseError) as e:
+        append_report_progress(f"{username}: error - {e}")
+        return False
+    except OSError as e:
+        append_report_progress(
+            f"{username}: error writing file - {e}")
+        return False
+
+# Generate reports for every username in the selected file.
+#
+# Each student's report is written to batch-report/<username>.txt.
+# The GUI text box shows per-student progress rather than the full
+# report text.
+def run_batch_reports(deadline):
+    if not username_file_path:
+        messagebox.showerror(
+            "Error", "Please select a username file.")
+        return
+
+    try:
+        usernames = load_usernames_from_file(username_file_path)
+    except OSError as e:
+        messagebox.showerror(
+            "Error", f"Could not read username file: {e}")
+        return
+
+    if not usernames:
+        messagebox.showerror(
+            "Error",
+            "The selected file contains no usernames.")
+        return
+
+    output_dir = batch_report_dir()
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as e:
+        messagebox.showerror(
+            "Error",
+            f"Could not create output directory: {e}")
+        return
+
+    report_text.delete("1.0", tk.END)
+    n = len(usernames)
+    append_report_progress(
+        f"Starting batch report for {n} student(s)...")
+    append_report_progress(f"Output directory: {output_dir}")
+    append_report_progress("")
+
+    succeeded = 0
+    failed = 0
+    for i, username in enumerate(usernames, 1):
+        report_status_label.config(
+            text=f"Downloading solves for {username} ({i}/{n})...")
+        root.update()
+        if write_one_batch_report(username, deadline, output_dir):
+            succeeded += 1
+        else:
+            failed += 1
+
+    append_report_progress("")
+    append_report_progress(
+        f"Batch complete: {succeeded} succeeded, "
+        f"{failed} failed.")
+
+# Implements the "Generate Report" button
+#
+# Downloads completed challenges and compares them with the selected
+# challenges and deadline. In single-student mode the report is shown
+# in the GUI text box; in batch mode each student's report is written
+# to a file under batch-report/. All selected challenges are weighted
+# equally regardless of how they break down into modules.
+def on_generate_report_click():
+    deadline = parse_deadline_from_gui()
+    if deadline is None:
+        return
+    if not dojo or not all_challenges:
+        messagebox.showerror(
+            "Error",
+            "Please load a dojo on the first tab first.")
+        return
+    if not checked_challenges:
+        messagebox.showerror(
+            "Error",
+            "Please select at least one challenge.")
+        return
+
+    generate_button.config(state=tk.DISABLED)
+    single_radio.config(state=tk.DISABLED)
+    batch_radio.config(state=tk.DISABLED)
+    username_entry.config(state=tk.DISABLED)
+    select_file_button.config(state=tk.DISABLED)
+    try:
+        if report_mode.get() == "batch":
+            run_batch_reports(deadline)
+        else:
+            run_single_report(deadline)
+    finally:
+        generate_button.config(state=tk.NORMAL)
+        single_radio.config(state=tk.NORMAL)
+        batch_radio.config(state=tk.NORMAL)
+        on_report_mode_change()
+        report_status_label.config(text="")
 
 # Implements the "Now" button (sets current time in the GUI deadline fields)
 # Can also be called directly from other code that wishes to do this (e.g. on program startup)
@@ -498,10 +703,39 @@ notebook.add(tab2, text="Generate Report")
 input_frame = tk.Frame(tab2)
 input_frame.pack(anchor="w")
 
-tk.Label(input_frame, text="Username:").grid(row=0, column=0, sticky="w")
-username_entry = tk.Entry(input_frame)
-username_entry.grid(row=0, column=1, sticky="w")
+# Mode selection: single student vs. batch from a username file.
+# Nested so the radio rows don't have to share columns with the
+# deadline widgets below.
+mode_frame = tk.Frame(input_frame)
+mode_frame.grid(row=0, column=0, columnspan=11, sticky="w",
+                pady=(0, 5))
+
+report_mode = tk.StringVar(value="single")
+
+single_radio = tk.Radiobutton(
+    mode_frame, text="Single student:",
+    variable=report_mode, value="single",
+    command=on_report_mode_change)
+single_radio.grid(row=0, column=0, sticky="w")
+
+username_entry = tk.Entry(mode_frame)
+username_entry.grid(row=0, column=1, sticky="w", padx=(5, 0))
 username_entry.bind('<Return>', lambda e: on_generate_report_click())
+
+batch_radio = tk.Radiobutton(
+    mode_frame, text="Batch from file:",
+    variable=report_mode, value="batch",
+    command=on_report_mode_change)
+batch_radio.grid(row=1, column=0, sticky="w")
+
+select_file_button = tk.Button(
+    mode_frame, text="Select File...",
+    command=on_select_username_file_click,
+    state=tk.DISABLED)
+select_file_button.grid(row=1, column=1, sticky="w", padx=(5, 0))
+
+username_file_label = tk.Label(mode_frame, text="(no file selected)")
+username_file_label.grid(row=1, column=2, sticky="w", padx=(5, 0))
 
 tk.Label(input_frame, text="Deadline Date:").grid(row=1, column=0, sticky="w")
 date_entry = DateEntry(input_frame, date_pattern='yyyy-mm-dd')
@@ -530,10 +764,14 @@ offset_entry.grid(row=1, column=9, sticky="w")
 now_button = tk.Button(input_frame, text="Now", command=set_current_time)
 now_button.grid(row=1, column=10, sticky="w")
 
-generate_button = tk.Button(input_frame, text="Generate Report", command=on_generate_report_click)
+generate_button = tk.Button(
+    input_frame, text="Generate Report",
+    command=on_generate_report_click)
 generate_button.grid(row=2, column=0, sticky="w")
-report_status_label = tk.Label(input_frame, text="")  # displays download status when active
-report_status_label.grid(row=2, column=1, sticky="w", padx=(5, 0))
+# displays download status when active
+report_status_label = tk.Label(input_frame, text="")
+report_status_label.grid(row=2, column=1, columnspan=9, sticky="w",
+                         padx=(5, 0))
 
 # Text area
 text_frame = tk.Frame(tab2)
