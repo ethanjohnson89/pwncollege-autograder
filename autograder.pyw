@@ -1,4 +1,5 @@
 import os
+import shutil
 import requests
 from datetime import datetime, timezone, timedelta
 import tkinter as tk
@@ -387,6 +388,136 @@ def batch_report_dir():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(script_dir, BATCH_REPORT_DIRNAME)
 
+# True if path is a directory that contains at least one entry
+def dir_is_nonempty(path):
+    if not os.path.isdir(path):
+        return False
+    try:
+        with os.scandir(path) as entries:
+            for _ in entries:
+                return True
+        return False
+    except OSError:
+        return False
+
+# mtime of the newest file directly in path (not recursive).
+#
+# If the directory has no files, fall back to path's own mtime.
+def most_recent_file_mtime(path):
+    latest = None
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return os.path.getmtime(path)
+    for name in names:
+        entry = os.path.join(path, name)
+        try:
+            if os.path.isfile(entry):
+                mtime = os.path.getmtime(entry)
+                if latest is None or mtime > latest:
+                    latest = mtime
+        except OSError:
+            continue
+    if latest is None:
+        return os.path.getmtime(path)
+    return latest
+
+# Path to rename batch-report to, using the newest file's mtime.
+#
+# Suffix format is YYYY-MM-DD-HHMM (local time), e.g.
+# batch-report-2026-09-14-0137. If that name is already taken,
+# append -2, -3, and so on.
+def archived_batch_dir_path(path):
+    stamp = datetime.fromtimestamp(
+        most_recent_file_mtime(path)
+    ).strftime("%Y-%m-%d-%H%M")
+    parent = os.path.dirname(path)
+    base = f"{BATCH_REPORT_DIRNAME}-{stamp}"
+    candidate = os.path.join(parent, base)
+    if not os.path.exists(candidate):
+        return candidate
+    n = 2
+    while True:
+        candidate = os.path.join(parent, f"{base}-{n}")
+        if not os.path.exists(candidate):
+            return candidate
+        n += 1
+
+# Delete all files and subdirectories inside path, leaving path itself
+def erase_directory_contents(path):
+    for name in os.listdir(path):
+        entry = os.path.join(path, name)
+        if os.path.isdir(entry) and not os.path.islink(entry):
+            shutil.rmtree(entry)
+        else:
+            os.remove(entry)
+
+# Ask how to handle a nonempty batch-report directory.
+# Returns "erase", "merge", "rename", or "cancel".
+def ask_nonempty_batch_dir():
+    dialog = tk.Toplevel(root)
+    # Hide until the layout has a real size. On Windows, calling
+    # resizable(False) or geometry("+x+y") before that freezes the
+    # window at the first widget's size and clips the buttons.
+    dialog.withdraw()
+    dialog.title("Batch report directory")
+    dialog.transient(root)
+
+    result = {"choice": "cancel"}
+
+    def choose(choice):
+        result["choice"] = choice
+        dialog.destroy()
+
+    container = tk.Frame(dialog, padx=12, pady=10)
+    container.pack()
+
+    tk.Label(
+        container,
+        text=f"Directory '{BATCH_REPORT_DIRNAME}' is not empty",
+    ).pack(anchor="w", pady=(0, 8))
+
+    buttons = [
+        ("Erase existing contents", "erase"),
+        ("Merge (overwrite existing with same names)",
+         "merge"),
+        ("Rename existing directory (add date suffix) "
+         "then proceed", "rename"),
+        ("Cancel", "cancel"),
+    ]
+    for label, choice in buttons:
+        tk.Button(
+            container, text=label,
+            command=lambda c=choice: choose(c),
+            anchor="w",
+        ).pack(fill="x", pady=2)
+
+    dialog.protocol("WM_DELETE_WINDOW", lambda: choose("cancel"))
+    dialog.bind("<Escape>", lambda e: choose("cancel"))
+
+    dialog.update_idletasks()
+    dw = max(dialog.winfo_reqwidth(),
+             container.winfo_reqwidth())
+    dh = max(dialog.winfo_reqheight(),
+             container.winfo_reqheight())
+    px = root.winfo_rootx()
+    py = root.winfo_rooty()
+    pw = root.winfo_width()
+    ph = root.winfo_height()
+    x = px + max((pw - dw) // 2, 0)
+    y = py + max((ph - dh) // 2, 0)
+    dialog.geometry(f"{dw}x{dh}+{x}+{y}")
+    dialog.minsize(dw, dh)
+    dialog.resizable(False, False)
+
+    dialog.deiconify()
+    dialog.lift()
+    dialog.wait_visibility()
+    dialog.grab_set()
+    dialog.focus_set()
+    dialog.wait_window()
+    return result["choice"]
+
 # Read student usernames from a text file (one per line).
 #
 # Blank lines and # comments are ignored, surrounding whitespace is
@@ -538,6 +669,34 @@ def run_batch_reports(deadline):
         return
 
     output_dir = batch_report_dir()
+    preexisting_note = None
+    if dir_is_nonempty(output_dir):
+        choice = ask_nonempty_batch_dir()
+        if choice == "cancel":
+            return
+        try:
+            if choice == "erase":
+                erase_directory_contents(output_dir)
+                preexisting_note = (
+                    "Erased existing contents of "
+                    f"{BATCH_REPORT_DIRNAME}")
+            elif choice == "rename":
+                archived = archived_batch_dir_path(output_dir)
+                os.rename(output_dir, archived)
+                preexisting_note = (
+                    f"Renamed existing {BATCH_REPORT_DIRNAME} "
+                    f"to {os.path.basename(archived)}")
+            elif choice == "merge":
+                preexisting_note = (
+                    f"Merging into existing "
+                    f"{BATCH_REPORT_DIRNAME} (same names will "
+                    f"be overwritten)")
+        except OSError as e:
+            messagebox.showerror(
+                "Error",
+                f"Could not prepare output directory: {e}")
+            return
+
     try:
         os.makedirs(output_dir, exist_ok=True)
     except OSError as e:
@@ -551,6 +710,8 @@ def run_batch_reports(deadline):
     append_report_progress(
         f"Starting batch report for {n} student(s)...")
     append_report_progress(f"Output directory: {output_dir}")
+    if preexisting_note:
+        append_report_progress(preexisting_note)
     append_report_progress("")
 
     succeeded = 0
