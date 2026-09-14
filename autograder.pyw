@@ -1,3 +1,4 @@
+import csv
 import os
 import shutil
 import requests
@@ -24,9 +25,9 @@ checked_challenges = set()
 dojo = ""
 current_timezone = None  # Track the timezone from "Now" button
 
-# Path to the student-username list used in batch mode, or None if
-# no file has been selected yet.
-username_file_path = None
+# Path to the student CSV used in batch mode, or None if no file
+# has been selected yet.
+student_csv_path = None
 
 # Subfolder (next to this script) where batch mode writes per-student
 # report files.
@@ -370,18 +371,60 @@ def update_parent(child):
         # Apply the new text to the parent's entry in the tree
         tree.item(parent, text=new_parent_text)
 
-# Build a filesystem-safe .txt filename from a student username
-def report_filename_for(username):
-    allowed = []
-    for ch in username:
-        if ch.isalnum() or ch in "._-":
-            allowed.append(ch)
+# Make a human-readable filename stem safe for Windows/Linux.
+#
+# Commas and spaces are kept so names like "Lastname, Firstname -
+# Assignment" stay readable. Characters that are illegal in
+# Windows filenames are replaced with underscores.
+def sanitize_filename_stem(stem):
+    forbidden = '<>:"/\\|?*'
+    chars = []
+    for ch in stem:
+        if ch in forbidden or ord(ch) < 32:
+            chars.append("_")
         else:
-            allowed.append("_")
-    safe = "".join(allowed).strip("._")
+            chars.append(ch)
+    safe = "".join(chars).strip(" .")
     if not safe:
         safe = "unknown"
-    return f"{safe}.txt"
+    return safe
+
+# Filename for one student's batch report.
+#
+# Default: "Lastname, Firstname.txt". If assignment_name is
+# provided: "Lastname, Firstname - Assignment Name.txt".
+# disambiguator, if given, is inserted after the person's name.
+def report_filename_for_student(student, assignment_name,
+                                disambiguator=""):
+    display = f"{student['last']}, {student['first']}"
+    if disambiguator:
+        display = f"{display} ({disambiguator})"
+    assignment_name = assignment_name.strip()
+    if assignment_name:
+        stem = f"{display} - {assignment_name}"
+    else:
+        stem = display
+    return sanitize_filename_stem(stem) + ".txt"
+
+# Pick a report filename that has not already been used this batch.
+#
+# On a collision (two students with the same display name), the
+# pwn.college username is appended to keep both files.
+def allocate_report_filename(student, assignment_name, used):
+    filename = report_filename_for_student(
+        student, assignment_name)
+    if filename in used:
+        filename = report_filename_for_student(
+            student, assignment_name,
+            disambiguator=student["username"])
+        n = 2
+        while filename in used:
+            filename = report_filename_for_student(
+                student, assignment_name,
+                disambiguator=f"{student['username']}-{n}")
+            n += 1
+    used.add(filename)
+    return filename
 
 # Absolute path of the batch-report output directory (next to this script)
 def batch_report_dir():
@@ -519,22 +562,52 @@ def ask_nonempty_batch_dir():
     dialog.wait_window()
     return result["choice"]
 
-# Read student usernames from a text file (one per line).
+# Read students from a CSV with columns: last, first, username.
 #
-# Blank lines and # comments are ignored, surrounding whitespace is
-# stripped, and duplicates are dropped while preserving first-seen
-# order.
-def load_usernames_from_file(path):
-    usernames = []
+# Blank lines and # comments are ignored. A header row is skipped
+# if the first two fields look like last/first column names.
+# Duplicate usernames are dropped, keeping the first occurrence.
+# Extra columns beyond the first three are ignored.
+def load_students_from_csv(path):
+    students = []
     seen = set()
-    with open(path, encoding="utf-8-sig") as handle:
-        for line in handle:
-            name = line.strip()
-            if not name or name.startswith("#") or name in seen:
+    first_data = True
+    with open(path, encoding="utf-8-sig", newline="") as handle:
+        reader = csv.reader(handle)
+        for row_num, row in enumerate(reader, 1):
+            if not row or all(not c.strip() for c in row):
                 continue
-            seen.add(name)
-            usernames.append(name)
-    return usernames
+            if row[0].lstrip().startswith("#"):
+                continue
+            if len(row) < 3:
+                raise ValueError(
+                    f"Line {row_num}: expected 3 columns "
+                    f"(last, first, username), "
+                    f"found {len(row)}")
+            last = row[0].strip()
+            first = row[1].strip()
+            username = row[2].strip()
+            if first_data:
+                first_data = False
+                if (last.lower() in (
+                        "last", "lastname", "last name")
+                        and first.lower() in (
+                            "first", "firstname",
+                            "first name")):
+                    continue
+            if not last or not first or not username:
+                raise ValueError(
+                    f"Line {row_num}: last name, first name, "
+                    f"and username are all required")
+            if username in seen:
+                continue
+            seen.add(username)
+            students.append({
+                "last": last,
+                "first": first,
+                "username": username,
+            })
+    return students
 
 # Append a line to the report text box and scroll it into view
 def append_report_progress(message):
@@ -566,28 +639,33 @@ def on_report_mode_change():
     if report_mode.get() == "single":
         username_entry.config(state=tk.NORMAL)
         select_file_button.config(state=tk.DISABLED)
+        assignment_entry.config(state=tk.DISABLED)
     else:
         username_entry.config(state=tk.DISABLED)
         select_file_button.config(state=tk.NORMAL)
+        assignment_entry.config(state=tk.NORMAL)
 
-# Launch a file picker and remember the chosen username list
-def on_select_username_file_click():
-    global username_file_path
+# Launch a file picker and remember the chosen student CSV
+def on_select_student_csv_click():
+    global student_csv_path
     path = filedialog.askopenfilename(
-        title="Select username list",
+        title="Select student CSV",
         filetypes=[
+            ("CSV files", "*.csv"),
             ("Text files", "*.txt"),
             ("All files", "*.*"),
         ])
     if not path:
         return
-    username_file_path = path
+    student_csv_path = path
     try:
-        count = len(load_usernames_from_file(path))
-        username_file_label.config(
+        count = len(load_students_from_csv(path))
+        student_file_label.config(
             text=f"{os.path.basename(path)} ({count} student(s))")
-    except OSError:
-        username_file_label.config(text=os.path.basename(path))
+    except (OSError, ValueError, csv.Error) as e:
+        student_file_label.config(text=os.path.basename(path))
+        messagebox.showerror(
+            "Error", f"Could not read student CSV: {e}")
 
 # Generate one student's report into the GUI text box
 def run_single_report(deadline):
@@ -614,60 +692,82 @@ def run_single_report(deadline):
         messagebox.showerror(
             "Error", f"Server response error: {str(e)}")
 
+# Append a multi-line per-student summary to the batch log.
+#
+# processed/total is how far the batch has gotten after this
+# student (1-based). filename is included on success only.
+def append_student_batch_progress(student, processed, total,
+                                  status_line, filename=None):
+    display = f"{student['last']}, {student['first']}"
+    username = student["username"]
+    pct = (processed / total) * 100 if total else 0.0
+    append_report_progress(f"{display} ({username})")
+    append_report_progress(f"  {status_line}")
+    if filename:
+        append_report_progress(f"  Report written to '{filename}'")
+    append_report_progress(
+        f"  {processed}/{total} students processed "
+        f"({pct:.1f}%)")
+    append_report_progress("")
+
 # Generate one student's report and write it under output_dir.
 # Returns True on success, False on failure (already logged).
-def write_one_batch_report(username, deadline, output_dir):
+def write_one_batch_report(student, deadline, output_dir,
+                           filename, processed, total):
+    username = student["username"]
     try:
         report = generate_report(username, dojo, deadline)
-        filename = report_filename_for(username)
         out_path = os.path.join(output_dir, filename)
         with open(out_path, "w", encoding="utf-8") as handle:
             handle.write(report)
             if not report.endswith("\n"):
                 handle.write("\n")
 
-        # Include the overall score in the progress line so the
-        # batch log is scannable without opening every file.
         last_line = report.strip().split("\n")[-1]
         if last_line.startswith("Overall:"):
-            append_report_progress(
-                f"{username}: done - {last_line} ({filename})")
+            status = f"Grading successful. {last_line}"
         else:
-            append_report_progress(
-                f"{username}: done ({filename})")
+            status = "done"
+        append_student_batch_progress(
+            student, processed, total, status, filename)
         return True
     except (DojoNotFoundError, DojoNetworkError,
             DojoParseError) as e:
-        append_report_progress(f"{username}: error - {e}")
+        append_student_batch_progress(
+            student, processed, total, f"Error: {e}")
         return False
     except OSError as e:
-        append_report_progress(
-            f"{username}: error writing file - {e}")
+        append_student_batch_progress(
+            student, processed, total,
+            f"error writing file - {e}")
         return False
 
-# Generate reports for every username in the selected file.
+# Generate reports for every student in the selected CSV.
 #
-# Each student's report is written to batch-report/<username>.txt.
-# The GUI text box shows per-student progress rather than the full
-# report text.
+# Each student's report is written under batch-report/ as
+# "Lastname, Firstname - Assignment.txt" (or without the
+# assignment suffix if that field is blank). The GUI text box
+# shows per-student progress rather than the full report text.
 def run_batch_reports(deadline):
-    if not username_file_path:
+    if not student_csv_path:
         messagebox.showerror(
-            "Error", "Please select a username file.")
+            "Error", "Please select a student CSV file.")
         return
 
     try:
-        usernames = load_usernames_from_file(username_file_path)
-    except OSError as e:
+        students = load_students_from_csv(student_csv_path)
+    except (OSError, ValueError, csv.Error) as e:
         messagebox.showerror(
-            "Error", f"Could not read username file: {e}")
+            "Error", f"Could not read student CSV: {e}")
         return
 
-    if not usernames:
+    if not students:
         messagebox.showerror(
             "Error",
-            "The selected file contains no usernames.")
+            "The selected file contains no students.")
         return
+
+    assignment_name = assignment_entry.get().strip()
 
     output_dir = batch_report_dir()
     preexisting_note = None
@@ -707,26 +807,35 @@ def run_batch_reports(deadline):
         return
 
     report_text.delete("1.0", tk.END)
-    n = len(usernames)
+    n = len(students)
     append_report_progress(
         f"Starting batch report for {n} student(s)...")
     append_report_progress(f"Output directory: {output_dir}")
+    if assignment_name:
+        append_report_progress(
+            f"Assignment: {assignment_name}")
     if preexisting_note:
         append_report_progress(preexisting_note)
     append_report_progress("")
 
     succeeded = 0
     failed = 0
-    for i, username in enumerate(usernames, 1):
+    used_filenames = set()
+    for i, student in enumerate(students, 1):
+        username = student["username"]
         report_status_label.config(
-            text=f"Downloading solves for {username} ({i}/{n})...")
+            text=f"Downloading solves for {username} "
+                 f"({i}/{n})...")
         root.update()
-        if write_one_batch_report(username, deadline, output_dir):
+        filename = allocate_report_filename(
+            student, assignment_name, used_filenames)
+        if write_one_batch_report(
+                student, deadline, output_dir, filename,
+                i, n):
             succeeded += 1
         else:
             failed += 1
 
-    append_report_progress("")
     append_report_progress(
         f"Batch complete: {succeeded} succeeded, "
         f"{failed} failed.")
@@ -758,6 +867,7 @@ def on_generate_report_click():
     batch_radio.config(state=tk.DISABLED)
     username_entry.config(state=tk.DISABLED)
     select_file_button.config(state=tk.DISABLED)
+    assignment_entry.config(state=tk.DISABLED)
     try:
         if report_mode.get() == "batch":
             run_batch_reports(deadline)
@@ -865,7 +975,7 @@ notebook.add(tab2, text="Generate Report")
 input_frame = tk.Frame(tab2)
 input_frame.pack(anchor="w")
 
-# Mode selection: single student vs. batch from a username file.
+# Mode selection: single student vs. batch from a student CSV.
 # Nested so the radio rows don't have to share columns with the
 # deadline widgets below.
 mode_frame = tk.Frame(input_frame)
@@ -885,19 +995,25 @@ username_entry.grid(row=0, column=1, sticky="w", padx=(5, 0))
 username_entry.bind('<Return>', lambda e: on_generate_report_click())
 
 batch_radio = tk.Radiobutton(
-    mode_frame, text="Batch from file:",
+    mode_frame, text="Batch from CSV:",
     variable=report_mode, value="batch",
     command=on_report_mode_change)
 batch_radio.grid(row=1, column=0, sticky="w")
 
 select_file_button = tk.Button(
     mode_frame, text="Select File...",
-    command=on_select_username_file_click,
+    command=on_select_student_csv_click,
     state=tk.DISABLED)
 select_file_button.grid(row=1, column=1, sticky="w", padx=(5, 0))
 
-username_file_label = tk.Label(mode_frame, text="(no file selected)")
-username_file_label.grid(row=1, column=2, sticky="w", padx=(5, 0))
+student_file_label = tk.Label(mode_frame, text="(no file selected)")
+student_file_label.grid(row=1, column=2, sticky="w", padx=(5, 0))
+
+assignment_label = tk.Label(mode_frame, text="Assignment:")
+assignment_label.grid(row=1, column=3, sticky="w", padx=(15, 0))
+assignment_entry = tk.Entry(mode_frame, width=24)
+assignment_entry.grid(row=1, column=4, sticky="w", padx=(5, 0))
+assignment_entry.config(state=tk.DISABLED)
 
 tk.Label(input_frame, text="Deadline Date:").grid(row=1, column=0, sticky="w")
 date_entry = DateEntry(input_frame, date_pattern='yyyy-mm-dd')
