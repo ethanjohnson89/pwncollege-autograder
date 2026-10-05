@@ -22,6 +22,7 @@ class DojoParseError(Exception):
 # Global variables
 all_challenges = {}
 checked_challenges = set()
+extra_credit_challenges = set()
 dojo = ""
 current_timezone = None  # Track the timezone from "Now" button
 
@@ -124,10 +125,16 @@ def get_timezone_display(deadline, abbreviated=False):
     return f"(UTC{deadline.utcoffset().total_seconds()/3600:+.0f})"
 
 # Generates a grading report for a student based on the given deadline and list of assigned
-# challenges selected on the first tab
+# challenges selected on the first tab.
+#
+# Required challenges ([x]) count in both the numerator and the
+# denominator. Extra-credit challenges ([E]) count in the numerator
+# only when solved before the deadline, so the percentage can
+# exceed 100.
 def generate_report(username, dojo, deadline):
     assert all_challenges, "No dojo selected; can't generate report."
-    assert checked_challenges, "No challenges selected; can't generate report."
+    assert (checked_challenges or extra_credit_challenges), \
+        "No challenges selected; can't generate report."
 
     # Download the list of challenges solved by the student within this dojo
     solves_dict = get_student_solves(username, dojo)
@@ -166,41 +173,89 @@ def generate_report(username, dojo, deadline):
     report.append("")
 
     overall_before_deadline = 0
-    total_challenges = len(checked_challenges)
+    overall_extra_before = 0
+    total_required = len(checked_challenges)
+    total_extra = len(extra_credit_challenges)
 
     #
     # Detailed breakdown by module
     #
     for module in all_challenges:
-        # Check if any challenge in this module is assigned
-        # (tracking challenges as "module:challenge", since different modules could have challenges with the same name)
-        if any(f"{module}:{ch}" in checked_challenges for ch in all_challenges[module]):
-            report.append(f"Module: {module}")
+        # Challenges are tracked as "module:challenge", since
+        # different modules can reuse a challenge name.
+        required = [
+            ch for ch in all_challenges[module]
+            if f"{module}:{ch}" in checked_challenges]
+        extra = [
+            ch for ch in all_challenges[module]
+            if f"{module}:{ch}" in extra_credit_challenges]
+        if not required and not extra:
+            continue
 
-            challenges_solved = solves_dict.get(module, {})
-            module_before_deadline = 0
+        report.append(f"Module: {module}")
+        challenges_solved = solves_dict.get(module, {})
+        module_before_deadline = 0
+        module_extra_before = 0
 
-            for challenge in all_challenges[module]:
-                if f"{module}:{challenge}" in checked_challenges:
-                    if challenge in challenges_solved:
-                        timestamp = challenges_solved[challenge]
-                        # Convert solve timestamp to the same timezone as deadline
-                        timestamp_local = timestamp.astimezone(deadline.tzinfo)
-                        formatted_timestamp = timestamp_local.strftime("%Y-%m-%d %H:%M:%S")
-                        report.append(f"  {challenge}: Solved at {formatted_timestamp} {tz_display_short}")
-                        if timestamp < deadline:
-                            module_before_deadline += 1
+        for challenge in all_challenges[module]:
+            is_extra = challenge in extra
+            is_required = challenge in required
+            if not is_extra and not is_required:
+                continue
+            suffix = " (extra credit)" if is_extra else ""
+            if challenge in challenges_solved:
+                timestamp = challenges_solved[challenge]
+                # Convert solve timestamp to the deadline timezone
+                timestamp_local = timestamp.astimezone(
+                    deadline.tzinfo)
+                formatted_timestamp = timestamp_local.strftime(
+                    "%Y-%m-%d %H:%M:%S")
+                report.append(
+                    f"  {challenge}: Solved at "
+                    f"{formatted_timestamp} "
+                    f"{tz_display_short}{suffix}")
+                if timestamp < deadline:
+                    if is_extra:
+                        module_extra_before += 1
                     else:
-                        report.append(f"  {challenge}: Not solved")
+                        module_before_deadline += 1
+            else:
+                report.append(
+                    f"  {challenge}: Not solved{suffix}")
 
-            total_in_module = len([ch for ch in all_challenges[module] if f"{module}:{ch}" in checked_challenges])
-            overall_before_deadline += module_before_deadline
-            percentage = (module_before_deadline / total_in_module) * 100 if total_in_module > 0 else 0
-            report.append(f"{module_before_deadline}/{total_in_module} solved before deadline ({percentage:.1f}%)")
-            report.append("")
+        if required:
+            percentage = (
+                module_before_deadline / len(required)) * 100
+            report.append(
+                f"{module_before_deadline}/{len(required)} "
+                f"solved before deadline ({percentage:.1f}%)")
+        if extra:
+            report.append(
+                f"Extra credit: {module_extra_before}/"
+                f"{len(extra)} solved before deadline")
+        report.append("")
 
-    overall_percentage = (overall_before_deadline / total_challenges) * 100 if total_challenges > 0 else 0
-    report.append(f"Overall: {overall_before_deadline}/{total_challenges} solved before deadline ({overall_percentage:.1f}%)")
+        overall_before_deadline += (
+            module_before_deadline + module_extra_before)
+        overall_extra_before += module_extra_before
+
+    if total_required:
+        overall_percentage = (
+            overall_before_deadline / total_required) * 100
+        report.append(
+            f"Overall: {overall_before_deadline}/"
+            f"{total_required} solved before deadline "
+            f"({overall_percentage:.1f}%)")
+        if total_extra:
+            report.append(
+                f"Extra credit: {overall_extra_before}/"
+                f"{total_extra} solved before deadline "
+                f"(included in the numerator above)")
+    else:
+        report.append(
+            f"Overall: {overall_extra_before} extra credit "
+            f"solved before deadline "
+            f"(no required challenges)")
 
     return "\n".join(report)
 
@@ -208,6 +263,7 @@ def generate_report(username, dojo, deadline):
 # (downloads the challenge list from pwn.college and populates the tree view)
 def on_load_challenges_click():
     global dojo, all_challenges, checked_challenges
+    global extra_credit_challenges
 
     dojo = dojo_entry.get()
     if not dojo:
@@ -230,6 +286,7 @@ def on_load_challenges_click():
         for item in tree.get_children():
             tree.delete(item)
         checked_challenges.clear()
+        extra_credit_challenges.clear()
 
         # Populate tree view with the challenge list we downloaded
         for module, challenges in all_challenges.items():
@@ -254,118 +311,115 @@ def on_load_challenges_click():
         status_label.config(text="")
         messagebox.showerror("Error", f"Server response error: {str(e)}")
 
-# Select all challenges in the dojo
+# Checkbox prefixes are all exactly 4 characters, including the
+# trailing space: "[ ] ", "[x] ", "[-] ", "[E] ". Keeping them
+# the same width means the name always starts at index 4.
+def item_mark(text):
+    return text[1]
+
+def item_name(text):
+    return text[4:]
+
+# Set one challenge to required ('x'), extra credit ('E'), or off (' ').
+def set_challenge_mark(module_name, child, mark):
+    child_name = item_name(tree.item(child, 'text'))
+    key = f"{module_name}:{child_name}"
+    checked_challenges.discard(key)
+    extra_credit_challenges.discard(key)
+    if mark == 'x':
+        checked_challenges.add(key)
+    elif mark == 'E':
+        extra_credit_challenges.add(key)
+    tree.item(child, text=f'[{mark}] {child_name}')
+
+# Set every challenge in a module to the same mark and refresh the parent
+def set_module_children(module_item, mark):
+    module_name = item_name(tree.item(module_item, 'text'))
+    for child in tree.get_children(module_item):
+        set_challenge_mark(module_name, child, mark)
+    update_module_mark(module_item)
+
+# Refresh a module's prefix from its children's marks.
+#
+# [x] if every child is required, [E] if every child is extra
+# credit, [ ] if every child is off, otherwise [-].
+def update_module_mark(module_item):
+    children = tree.get_children(module_item)
+    marks = [item_mark(tree.item(c, 'text')) for c in children]
+    name = item_name(tree.item(module_item, 'text'))
+    if not marks or all(m == ' ' for m in marks):
+        mark = ' '
+    elif all(m == 'x' for m in marks):
+        mark = 'x'
+    elif all(m == 'E' for m in marks):
+        mark = 'E'
+    else:
+        mark = '-'
+    tree.item(module_item, text=f'[{mark}] {name}')
+
+# Select all challenges in the dojo as required
 def on_select_all_click():
     if not all_challenges:
         return
-
-    # Find modules that aren't fully checked and toggle them
     for module_id in tree.get_children():
-        module_text = tree.item(module_id, 'text')
-        if not module_text.startswith('[x]'):
-            toggle_check(module_id)
+        set_module_children(module_id, 'x')
 
-# Deselect all challenges in the dojo
+# Clear required and extra-credit marks in the dojo
 def on_deselect_all_click():
     if not all_challenges:
         return
-
-    # Find modules that have any selection and toggle them until they're unchecked
     for module_id in tree.get_children():
-        module_text = tree.item(module_id, 'text')
-        if module_text.startswith('[-]'):
-            # Partially selected - toggle twice (first to select all, then to deselect all)
-            toggle_check(module_id)
-            toggle_check(module_id)
-        elif module_text.startswith('[x]'):
-            # Fully selected - toggle once to deselect
-            toggle_check(module_id)
+        set_module_children(module_id, ' ')
 
-# Handle tree item clicks
+# Left click: toggle required assignment.
+# On a module, sets every child required unless they already all are.
 def on_tree_click(event):
     item = tree.identify('item', event.x, event.y)
     if item:
         toggle_check(item)
-        return "break"  # Prevent default treeview behavior
+    return "break"
 
-# Toggle the check state of a tree item (and its children if applicable)
+# Right click: toggle extra credit.
+# On a module, marks every child extra credit unless they already all are.
+def on_tree_right_click(event):
+    item = tree.identify('item', event.x, event.y)
+    if item:
+        toggle_extra_credit(item)
+    return "break"
+
 def toggle_check(item):
-    current_text = tree.item(item, 'text')
-    name = current_text[4:]  # Extract name after '[ ] ' or '[x] ' or '[-] '
-    if '[ ]' in current_text:
-        new_text = current_text.replace('[ ]', '[x]')
-        if 'module' in tree.item(item, 'tags'):
-            # Check all children
-            module_name = name
-            for child in tree.get_children(item):
-                child_text = tree.item(child, 'text')
-                tree.item(child, text=child_text.replace('[ ]', '[x]'))
-                child_name = child_text[4:]
-                checked_challenges.add(f"{module_name}:{child_name}")
+    if 'module' in tree.item(item, 'tags'):
+        marks = [
+            item_mark(tree.item(c, 'text'))
+            for c in tree.get_children(item)]
+        if marks and all(m == 'x' for m in marks):
+            set_module_children(item, ' ')
         else:
-            # Get the module name from the parent
-            parent = tree.parent(item)
-            module_name = tree.item(parent, 'text')[4:]
-            checked_challenges.add(f"{module_name}:{name}")
-            tree.item(item, text=new_text)  # Update item first
-            update_parent(item)
-            return  # Exit early to avoid updating twice
-    elif '[x]' in current_text:
-        new_text = current_text.replace('[x]', '[ ]')
-        if 'module' in tree.item(item, 'tags'):
-            # Uncheck all children
-            module_name = name
-            for child in tree.get_children(item):
-                child_text = tree.item(child, 'text')
-                tree.item(child, text=child_text.replace('[x]', '[ ]'))
-                child_name = child_text[4:]
-                checked_challenges.discard(f"{module_name}:{child_name}")
+            set_module_children(item, 'x')
+    else:
+        parent = tree.parent(item)
+        module_name = item_name(tree.item(parent, 'text'))
+        mark = item_mark(tree.item(item, 'text'))
+        set_challenge_mark(
+            module_name, item, ' ' if mark == 'x' else 'x')
+        update_module_mark(parent)
+
+def toggle_extra_credit(item):
+    if 'module' in tree.item(item, 'tags'):
+        marks = [
+            item_mark(tree.item(c, 'text'))
+            for c in tree.get_children(item)]
+        if marks and all(m == 'E' for m in marks):
+            set_module_children(item, ' ')
         else:
-            # Get the module name from the parent
-            parent = tree.parent(item)
-            module_name = tree.item(parent, 'text')[4:]
-            checked_challenges.discard(f"{module_name}:{name}")
-            tree.item(item, text=new_text)  # Update item first
-            update_parent(item)
-            return  # Exit early to avoid updating twice
-    elif '[-]' in current_text:
-        # Treat as select all (check all children)
-        new_text = current_text.replace('[-]', '[x]')
-        if 'module' in tree.item(item, 'tags'):
-            # Check all children
-            module_name = name
-            for child in tree.get_children(item):
-                child_text = tree.item(child, 'text')
-                tree.item(child, text=child_text.replace('[ ]', '[x]').replace('[-]', '[x]'))
-                child_name = child_text[4:]
-                checked_challenges.add(f"{module_name}:{child_name}")
-        else:
-            # Challenges should never have children, so this should not happen
-            assert False, "Challenge items should not have children"
-    tree.item(item, text=new_text)
-
-# Update a parent item's checkbox state in response to a change in one of its children
-def update_parent(child):
-    parent = tree.parent(child)
-    if parent:
-        children = tree.get_children(parent)
-        checked_count = sum(1 for c in children if '[x]' in tree.item(c, 'text'))
-        parent_text = tree.item(parent, 'text')
-
-        # Extract parent name - all checkbox prefixes are exactly 4 characters
-        # (namely: [ ] , [x] , [-])
-        parent_name = parent_text[4:]
-
-        # Update the parent item's text based on the children's checked state
-        if checked_count == 0:
-            new_parent_text = f'[ ] {parent_name}'
-        elif checked_count == len(children):
-            new_parent_text = f'[x] {parent_name}'
-        else:
-            new_parent_text = f'[-] {parent_name}'
-
-        # Apply the new text to the parent's entry in the tree
-        tree.item(parent, text=new_parent_text)
+            set_module_children(item, 'E')
+    else:
+        parent = tree.parent(item)
+        module_name = item_name(tree.item(parent, 'text'))
+        mark = item_mark(tree.item(item, 'text'))
+        set_challenge_mark(
+            module_name, item, ' ' if mark == 'E' else 'E')
+        update_module_mark(parent)
 
 # Make a human-readable filename stem safe for Windows/Linux.
 #
@@ -736,7 +790,7 @@ def on_generate_report_click():
             "Error",
             "Please load a dojo on the first tab first.")
         return
-    if not checked_challenges:
+    if not checked_challenges and not extra_credit_challenges:
         messagebox.showerror(
             "Error",
             "Please select at least one challenge.")
@@ -820,6 +874,11 @@ deselect_all_button.grid(row=0, column=4, sticky="w", padx=(5, 0))
 deselect_all_button.grid_remove()  # Hide initially
 status_label = tk.Label(dojo_frame, text="")  # displays download status when active
 status_label.grid(row=0, column=5, sticky="w", padx=(5, 0))
+tk.Label(
+    dojo_frame,
+    text="Left-click: required [x].  "
+         "Right-click: extra credit [E].",
+).grid(row=1, column=0, columnspan=6, sticky="w")
 
 # Create a frame for the tree and scrollbar
 tree_frame = tk.Frame(tab1)
@@ -842,6 +901,7 @@ style.layout("Treeview.Item", [
     ]})
 ])
 tree.bind('<Button-1>', on_tree_click)
+tree.bind('<Button-3>', on_tree_right_click)
 # Disable tree item opening/closing
 tree.bind('<Double-1>', lambda e: "break")
 tree.bind('<<TreeviewOpen>>', lambda e: "break")
